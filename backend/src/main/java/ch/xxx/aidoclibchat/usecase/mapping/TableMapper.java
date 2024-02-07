@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.springframework.jdbc.support.rowset.SqlRowSet;
@@ -56,7 +57,7 @@ public class TableMapper {
 		entity.setMuseumHoursId(new MuseumHoursId(dto.getMuseumId(), dto.getDay()));
 		return entity;
 	}
-	
+
 	public Museum map(MuseumDto dto) {
 		var entity = new Museum();
 		entity.setAddress(dto.getAddress());
@@ -70,7 +71,7 @@ public class TableMapper {
 		entity.setUrl(dto.getUrl());
 		return entity;
 	}
-	
+
 	public Artist map(ArtistDto dto) {
 		var entity = new Artist();
 		entity.setBirth(dto.getBirth());
@@ -84,14 +85,14 @@ public class TableMapper {
 		entity.setStyle(dto.getStyle());
 		return entity;
 	}
-	
+
 	public Subject map(SubjectDto dto) {
 		var entity = new Subject();
 		entity.setSubject(dto.getSubject());
 		entity.setWorkId(dto.getWorkId());
 		return entity;
 	}
-	
+
 	public WorkLink map(WorkLinkDto dto) {
 		var entity = new WorkLink();
 		entity.setArtistId(dto.getArtistId());
@@ -102,16 +103,22 @@ public class TableMapper {
 		entity.setWorkId(dto.getWorkId());
 		return entity;
 	}
-	
-	public List<Map<String,String>> map(SqlRowSet rowSet) {
+
+	public List<Map<String, String>> map(SqlRowSet rowSet) {
 		List<Map<String, String>> result = new ArrayList<>();
 		while (rowSet.next()) {
+			final AtomicInteger atomicIndex = new AtomicInteger(1);
 			Map<String, String> myRow = List.of(rowSet.getMetaData().getColumnNames()).stream()
-					.map(myCol -> Map.entry(myCol,
-							Optional.ofNullable(rowSet.getObject(myCol)).map(myOb -> myOb.toString()).orElse("")))
+					.map(myCol -> Map.entry(this.createPropertyName(myCol, rowSet, atomicIndex),
+							Optional.ofNullable(rowSet.getObject(atomicIndex.get())).map(myOb -> myOb.toString()).orElse("")))
+					.peek(x -> atomicIndex.set(atomicIndex.get() + 1))
 					.collect(Collectors.toMap(myEntry -> myEntry.getKey(), myEntry -> myEntry.getValue()));
 			result.add(myRow);
 		}
 		return result;
+	}
+
+	private String createPropertyName(String columnName, SqlRowSet rowSet, AtomicInteger atomicIndex) {
+		return columnName.contains("_") ? columnName : "" + atomicIndex.get() + "_" + columnName;
 	}
 }
