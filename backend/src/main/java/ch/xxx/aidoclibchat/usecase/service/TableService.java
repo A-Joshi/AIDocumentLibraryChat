@@ -12,6 +12,7 @@
  */
 package ch.xxx.aidoclibchat.usecase.service;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -57,7 +58,7 @@ import jakarta.transaction.Transactional;
 @Transactional
 public class TableService {
 	private static final Logger LOGGER = LoggerFactory.getLogger(TableService.class);
-	private static final Double MAX_ROW_DISTANCE = 0.45;
+	private static final Double MAX_ROW_DISTANCE = 0.30;
 	private final ImportClient importClient;
 	private final ImportService importService;
 	private final DocumentVsRepository documentVsRepository;
@@ -66,15 +67,15 @@ public class TableService {
 	private final JdbcTemplate jdbcTemplate;
 	private final String systemPrompt = """
 			 You are a Postgres expert. Given an input question, create syntactically correct Postgres query. \n
-			 Unless the user  specifies in the question a specific number of examples to  obtain, query for at most 5 results using the LIMIT clause \n
-			 as per Postgres. You can order the results to return the  most informative data in the database. Never query for all  columns from a table. \n
+			 Unless the user  specifies in the question a specific number of examples to  obtain, query for at most 100 results using the LIMIT clause \n
+			 as per Postgres. You order the results to return the  most informative data in the database. Never query for all  columns from a table. \n
 			 You must query only the columns that  are needed to answer the question. Wrap each column name in  double quotes to denote them as delimited identifiers. \n
 			 Pay attention to use only the column names you can see in the tables below. Be careful to not query for columns that do not exist. \n
 			 Also, pay attention to which column is in which table. \n
 			 Pay attention to use date('now') function to get the current date, if the question involves \"today\". \n
 			 Prefix the selected column names with the table name. Make sure all tables of the columns are added to the from clause. \n
 			 Make sure the column names are from the right table. Exclude all columns without table entry in the from clause. \n
-			 Create only the sql query. Remove any comment or explaination. \n
+			 Create only the Sql query. Remove any comment or explanation. \n
 			 If unsure, simply state that you don't know. \n
 			 Include these columns in the query: {columns} \n
 			 Only use the following tables: {schemas};\n
@@ -102,8 +103,15 @@ public class TableService {
 				searchDto.getResultAmount());
 		var columnDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.COLUMN,
 				searchDto.getResultAmount());
-		var rowDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.ROW,
-				searchDto.getResultAmount());
+		List<String> rowSearchStrs = new ArrayList<>();
+		if(searchDto.getSearchString().split("[ -.;,]").length > 5) {			
+			var tokens = List.of(searchDto.getSearchString().split("[ -.;,]"));		
+			for(int i = 0;i<tokens.size();i = i+3) {
+				rowSearchStrs.add(tokens.size() <= i + 3 ? "" : tokens.subList(i, tokens.size() >= i +6 ? i+6 : tokens.size()).stream().collect(Collectors.joining(" ")));
+			}
+		}
+		var rowDocuments = rowSearchStrs.stream().filter(myStr -> !myStr.isBlank()) .flatMap(myStr -> this.documentVsRepository.retrieve(myStr, MetaData.DataType.ROW,
+				searchDto.getResultAmount()).stream()).toList();
 
 //		LOGGER.info("Table: ");
 //		tableDocuments.forEach(myDoc -> LOGGER.info("name: {}, distance: {}",
@@ -173,8 +181,8 @@ public class TableService {
 		String chatResult = response.getResults().stream().map(myGen -> myGen.getOutput().getContent())
 				.collect(Collectors.joining(","));
 		LOGGER.info("AI response time: {}ms", new Date().getTime() - chatStart.getTime());
-//		LOGGER.info("AI response: {}", chatResult);
-		String sqlQuery = chatResult; // .split(";")[0];
+		LOGGER.info("AI response: {}", chatResult);
+		String sqlQuery = chatResult; 
 		sqlQuery = sqlQuery.indexOf("'''") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("'''") + 3);
 		sqlQuery = sqlQuery.indexOf("```") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("```") + 3);
 		sqlQuery = sqlQuery.indexOf("\"\"\"") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("\"\"\"") + 3);
@@ -190,7 +198,6 @@ public class TableService {
 				.compareTo(((Float) myDocB.getMetadata().get(MetaData.DISTANCE)));
 	}
 
-	@Async
 	public void importData() {
 		var start = new Date();
 		LOGGER.info("Import started.");

@@ -10,20 +10,23 @@
    See the License for the specific language governing permissions and
    limitations under the License.
  */
-import { Routes } from '@angular/router';
+import { HttpClient } from '@angular/common/http';
+import { Injectable } from '@angular/core';
+import { Observable } from 'rxjs';
+import { TableSearch } from '../model/table-search';
 
-export const routes: Routes = [
-  {
-    path: "doclist",
-    loadChildren: () => import("./doc-list").then((mod) => mod.DOCLIST),
-  },
-  {
-    path: "docsearch",
-    loadChildren: () => import("./doc-search").then((mod) => mod.DOCSEARCH),
-  },
-  {
-    path: "tablesearch",
-    loadChildren: () => import("./table-search").then((mod) => mod.TABLESEARCH),
-  },
-  { path: "**", redirectTo: "doclist" },
-];
+@Injectable({
+  providedIn: 'root'
+})
+export class TableService {
+
+  constructor(private httpClient: HttpClient) { }
+  
+  postTableSearch(tableSearch: TableSearch): Observable<TableSearch> {
+	  return this.httpClient.post<TableSearch>('/rest/table/search', tableSearch);
+  }
+  
+  getDataImport(): Observable<boolean> {
+	  return this.httpClient.get<boolean>('/rest/table/import');
+  }
+}
