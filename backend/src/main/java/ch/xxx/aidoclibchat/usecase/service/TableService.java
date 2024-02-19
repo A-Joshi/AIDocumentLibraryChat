@@ -35,7 +35,6 @@ import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.rowset.SqlRowSet;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import ch.xxx.aidoclibchat.domain.client.ImportClient;
@@ -59,6 +58,17 @@ import jakarta.transaction.Transactional;
 public class TableService {
 	private static final Logger LOGGER = LoggerFactory.getLogger(TableService.class);
 	private static final Double MAX_ROW_DISTANCE = 0.30;
+
+	private record EmbeddingContainer(List<Document> tableDocuments, List<Document> columnDocuments,
+			List<Document> rowDocuments) {
+	}
+
+	record TableColumnNames(List<String> tableNames, Set<String> columnNames) {
+	}
+
+	record TableNameSchema(String name, String schema) {
+	}
+
 	private final ImportClient importClient;
 	private final ImportService importService;
 	private final DocumentVsRepository documentVsRepository;
@@ -99,43 +109,88 @@ public class TableService {
 	}
 
 	public SqlRowSet searchTables(SearchDto searchDto) {
-		var tableDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.TABLE,
-				searchDto.getResultAmount());
-		var columnDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.COLUMN,
-				searchDto.getResultAmount());
-		List<String> rowSearchStrs = new ArrayList<>();
-		if(searchDto.getSearchString().split("[ -.;,]").length > 5) {			
-			var tokens = List.of(searchDto.getSearchString().split("[ -.;,]"));		
-			for(int i = 0;i<tokens.size();i = i+3) {
-				rowSearchStrs.add(tokens.size() <= i + 3 ? "" : tokens.subList(i, tokens.size() >= i +6 ? i+6 : tokens.size()).stream().collect(Collectors.joining(" ")));
-			}
-		}
-		var rowDocuments = rowSearchStrs.stream().filter(myStr -> !myStr.isBlank()) .flatMap(myStr -> this.documentVsRepository.retrieve(myStr, MetaData.DataType.ROW,
-				searchDto.getResultAmount()).stream()).toList();
+		EmbeddingContainer documentContainer = this.retrieveEmbeddings(searchDto);
 
-//		LOGGER.info("Table: ");
-//		tableDocuments.forEach(myDoc -> LOGGER.info("name: {}, distance: {}",
-//				myDoc.getMetadata().get(MetaData.DATANAME), myDoc.getMetadata().get(MetaData.DISTANCE)));
-//		LOGGER.info("Column: ");
-//		columnDocuments.forEach(myDoc -> LOGGER.info("name: {}, distance: {}",
-//				myDoc.getMetadata().get(MetaData.DATANAME), myDoc.getMetadata().get(MetaData.DISTANCE)));
-//		LOGGER.info("Row: ");
-//		rowDocuments.forEach(
-//				myDoc -> LOGGER.info("name: {}, content: {}, distance: {}", myDoc.getMetadata().get(MetaData.DATANAME),
-//						myDoc.getContent(), myDoc.getMetadata().get(MetaData.DISTANCE)));
+		Prompt prompt = createPrompt(searchDto, documentContainer);
 
-		final Float minRowDistance = rowDocuments.stream()
+		String sqlQuery = createQuery(prompt);
+
+		LOGGER.info("Sql query: {}", sqlQuery);
+		SqlRowSet rowSet = this.jdbcTemplate.queryForRowSet(sqlQuery);
+		return rowSet;
+	}
+
+	private String createQuery(Prompt prompt) {
+		var chatStart = new Date();
+		ChatResponse response = chatClient.call(prompt);
+		String chatResult = response.getResults().stream().map(myGen -> myGen.getOutput().getContent())
+				.collect(Collectors.joining(","));
+		LOGGER.info("AI response time: {}ms", new Date().getTime() - chatStart.getTime());
+		LOGGER.info("AI response: {}", chatResult);
+		String sqlQuery = chatResult;
+		sqlQuery = sqlQuery.indexOf("'''") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("'''") + 3);
+		sqlQuery = sqlQuery.indexOf("```") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("```") + 3);
+		sqlQuery = sqlQuery.indexOf("\"\"\"") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("\"\"\"") + 3);
+		sqlQuery = sqlQuery.toLowerCase().indexOf("select") < 0 ? sqlQuery
+				: sqlQuery.substring(sqlQuery.toLowerCase().indexOf("select"));
+		sqlQuery = sqlQuery.indexOf(";") < 0 ? sqlQuery : sqlQuery.substring(0, sqlQuery.indexOf(";") + 1);
+		return sqlQuery;
+	}
+
+	private Prompt createPrompt(SearchDto searchDto, EmbeddingContainer documentContainer) {
+		final Float minRowDistance = documentContainer.rowDocuments().stream()
 				.map(myDoc -> (Float) myDoc.getMetadata().getOrDefault(MetaData.DISTANCE, 1.0f)).sorted().findFirst()
 				.orElse(1.0f);
 		LOGGER.info("MinRowDistance: {}", minRowDistance);
-		var sortedRowDocs = rowDocuments.stream().sorted(this.compareDistance()).toList();
-		var sortedColumnDocs = columnDocuments.stream().sorted(this.compareDistance()).toList();
-		var sortedTableDocs = tableDocuments.stream().sorted(this.compareDistance()).toList();
+		var sortedRowDocs = documentContainer.rowDocuments().stream().sorted(this.compareDistance()).toList();
+		var tableColumnNames = this.createTableColumnNames(documentContainer);
+		List<TableNameSchema> tableRecords = this.tableMetadataRepository
+				.findByTableNameIn(tableColumnNames.tableNames()).stream()
+				.map(tableMetaData -> new TableNameSchema(tableMetaData.getTableName(), tableMetaData.getTableDdl()))
+				.collect(Collectors.toList());
+		final AtomicReference<String> joinColumn = new AtomicReference<String>("");
+		final AtomicReference<String> joinTable = new AtomicReference<String>("");
+		final AtomicReference<String> columnValue = new AtomicReference<String>("");
+		sortedRowDocs.stream().filter(myDoc -> minRowDistance <= MAX_ROW_DISTANCE).findFirst().ifPresent(myRowDoc -> {
+			joinTable.set(((String) myRowDoc.getMetadata().get(MetaData.TABLE_NAME)));
+			joinColumn.set(((String) myRowDoc.getMetadata().get(MetaData.DATANAME)));
+			tableColumnNames.columnNames().add(((String) myRowDoc.getMetadata().get(MetaData.DATANAME)));
+			columnValue.set(myRowDoc.getContent());
+			this.tableMetadataRepository
+					.findByTableNameIn(List.of(((String) myRowDoc.getMetadata().get(MetaData.TABLE_NAME)))).stream()
+					.map(myTableMetadata -> new TableNameSchema(myTableMetadata.getTableName(),
+							myTableMetadata.getTableDdl()))
+					.findFirst().ifPresent(myRecord -> tableRecords.add(myRecord));
+		});
+		var messages = this.createMessages(searchDto, minRowDistance, tableColumnNames, tableRecords, joinColumn,
+				joinTable, columnValue);
+		Prompt prompt = new Prompt(messages);
+//		LOGGER.info("Prompt: {}", prompt.getContents());
+		return prompt;
+	}
+
+	private List<Message> createMessages(SearchDto searchDto, final Float minRowDistance,
+			TableColumnNames tableColumnNames, List<TableNameSchema> tableRecords,
+			final AtomicReference<String> joinColumn, final AtomicReference<String> joinTable,
+			final AtomicReference<String> columnValue) {
 		SystemPromptTemplate systemPromptTemplate = this.activeProfile.contains("ollama")
 				? new SystemPromptTemplate(minRowDistance > MAX_ROW_DISTANCE ? String.format(this.ollamaPrompt, "")
 						: String.format(this.ollamaPrompt, columnMatch))
 				: new SystemPromptTemplate(minRowDistance > MAX_ROW_DISTANCE ? String.format(this.systemPrompt, "")
 						: String.format(this.systemPrompt, columnMatch));
+		Message systemMessage = systemPromptTemplate.createMessage(
+				Map.of("columns", tableColumnNames.columnNames().stream().collect(Collectors.joining(",")), "schemas",
+						tableRecords.stream().map(myRecord -> myRecord.schema()).collect(Collectors.joining(";")),
+						"prompt", searchDto.getSearchString(), "joinColumn", joinColumn.get(), "joinTable",
+						joinTable.get(), "columnValue", columnValue.get()));
+		UserMessage userMessage = this.activeProfile.contains("ollama") ? new UserMessage(systemMessage.getContent())
+				: new UserMessage(searchDto.getSearchString());
+		return List.of(systemMessage, userMessage);
+	}
+
+	private TableColumnNames createTableColumnNames(EmbeddingContainer documentContainer) {
+		var sortedColumnDocs = documentContainer.columnDocuments().stream().sorted(this.compareDistance()).toList();
+		var sortedTableDocs = documentContainer.tableDocuments().stream().sorted(this.compareDistance()).toList();
 		List<Document> filteredColDocs = sortedColumnDocs.stream()
 				.filter(myRowDoc -> sortedTableDocs.stream().limit(3)
 						.anyMatch(myTableDoc -> myTableDoc.getMetadata().get(MetaData.TABLE_NAME)
@@ -147,50 +202,40 @@ public class TableService {
 				.map(myDoc -> ((String) myDoc.getMetadata().get(MetaData.DATANAME))).collect(Collectors.toSet());
 		List<String> tableMetadataTableNames = filteredColDocs.stream()
 				.map(myDoc -> ((String) myDoc.getMetadata().get(MetaData.TABLE_NAME))).distinct().toList();
-		record TableNameSchema(String name, String schema) {
+		var tableColumnNames = new TableColumnNames(tableMetadataTableNames, columnNames);
+		return tableColumnNames;
+	}
+
+	private EmbeddingContainer retrieveEmbeddings(SearchDto searchDto) {
+		var tableDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.TABLE,
+				searchDto.getResultAmount());
+		var columnDocuments = this.documentVsRepository.retrieve(searchDto.getSearchString(), MetaData.DataType.COLUMN,
+				searchDto.getResultAmount());
+		List<String> rowSearchStrs = new ArrayList<>();
+		if (searchDto.getSearchString().split("[ -.;,]").length > 5) {
+			var tokens = List.of(searchDto.getSearchString().split("[ -.;,]"));
+			for (int i = 0; i < tokens.size(); i = i + 3) {
+				rowSearchStrs.add(tokens.size() <= i + 3 ? ""
+						: tokens.subList(i, tokens.size() >= i + 6 ? i + 6 : tokens.size()).stream()
+								.collect(Collectors.joining(" ")));
+			}
 		}
-		List<TableNameSchema> tableRecords = this.tableMetadataRepository.findByTableNameIn(tableMetadataTableNames)
-				.stream()
-				.map(tableMetaData -> new TableNameSchema(tableMetaData.getTableName(), tableMetaData.getTableDdl()))
-				.collect(Collectors.toList());
-		final AtomicReference<String> joinColumn = new AtomicReference<String>("");
-		final AtomicReference<String> joinTable = new AtomicReference<String>("");
-		final AtomicReference<String> columnValue = new AtomicReference<String>("");
-		sortedRowDocs.stream().filter(myDoc -> minRowDistance <= MAX_ROW_DISTANCE).findFirst().ifPresent(myRowDoc -> {
-			joinTable.set(((String) myRowDoc.getMetadata().get(MetaData.TABLE_NAME)));
-			joinColumn.set(((String) myRowDoc.getMetadata().get(MetaData.DATANAME)));
-			columnNames.add(((String) myRowDoc.getMetadata().get(MetaData.DATANAME)));
-			columnValue.set(myRowDoc.getContent());
-			this.tableMetadataRepository
-					.findByTableNameIn(List.of(((String) myRowDoc.getMetadata().get(MetaData.TABLE_NAME)))).stream()
-					.map(myTableMetadata -> new TableNameSchema(myTableMetadata.getTableName(),
-							myTableMetadata.getTableDdl()))
-					.findFirst().ifPresent(myRecord -> tableRecords.add(myRecord));
-		});
-		Message systemMessage = systemPromptTemplate
-				.createMessage(Map.of("columns", columnNames.stream().collect(Collectors.joining(",")), "schemas",
-						tableRecords.stream().map(myRecord -> myRecord.schema()).collect(Collectors.joining(";")),
-						"prompt", searchDto.getSearchString(), "joinColumn", joinColumn.get(), "joinTable",
-						joinTable.get(), "columnValue", columnValue.get()));
-		UserMessage userMessage = this.activeProfile.contains("ollama") ? new UserMessage(systemMessage.getContent())
-				: new UserMessage(searchDto.getSearchString());
-		Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
-//		LOGGER.info("Prompt: {}", prompt.getContents());
-		var chatStart = new Date();
-		ChatResponse response = chatClient.call(prompt);
-		String chatResult = response.getResults().stream().map(myGen -> myGen.getOutput().getContent())
-				.collect(Collectors.joining(","));
-		LOGGER.info("AI response time: {}ms", new Date().getTime() - chatStart.getTime());
-		LOGGER.info("AI response: {}", chatResult);
-		String sqlQuery = chatResult; 
-		sqlQuery = sqlQuery.indexOf("'''") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("'''") + 3);
-		sqlQuery = sqlQuery.indexOf("```") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("```") + 3);
-		sqlQuery = sqlQuery.indexOf("\"\"\"") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.indexOf("\"\"\"") + 3);
-		sqlQuery = sqlQuery.toLowerCase().indexOf("select") < 0 ? sqlQuery : sqlQuery.substring(sqlQuery.toLowerCase().indexOf("select"));
-		sqlQuery = sqlQuery.indexOf(";") < 0 ? sqlQuery : sqlQuery.substring(0, sqlQuery.indexOf(";") + 1);
-		LOGGER.info("Sql query: {}", sqlQuery);		
-		SqlRowSet rowSet = this.jdbcTemplate.queryForRowSet(sqlQuery);
-		return rowSet;
+		var rowDocuments = rowSearchStrs.stream().filter(myStr -> !myStr.isBlank())
+				.flatMap(myStr -> this.documentVsRepository
+						.retrieve(myStr, MetaData.DataType.ROW, searchDto.getResultAmount()).stream())
+				.toList();
+
+//		LOGGER.info("Table: ");
+//		tableDocuments.forEach(myDoc -> LOGGER.info("name: {}, distance: {}",
+//				myDoc.getMetadata().get(MetaData.DATANAME), myDoc.getMetadata().get(MetaData.DISTANCE)));
+//		LOGGER.info("Column: ");
+//		columnDocuments.forEach(myDoc -> LOGGER.info("name: {}, distance: {}",
+//				myDoc.getMetadata().get(MetaData.DATANAME), myDoc.getMetadata().get(MetaData.DISTANCE)));
+//		LOGGER.info("Row: ");
+//		rowDocuments.forEach(
+//				myDoc -> LOGGER.info("name: {}, content: {}, distance: {}", myDoc.getMetadata().get(MetaData.DATANAME),
+//						myDoc.getContent(), myDoc.getMetadata().get(MetaData.DISTANCE)));
+		return new EmbeddingContainer(tableDocuments, columnDocuments, rowDocuments);
 	}
 
 	private Comparator<? super Document> compareDistance() {
@@ -249,7 +294,7 @@ public class TableService {
 		result.getMetadata().put(MetaData.ID, work.getId());
 		result.getMetadata().put(MetaData.DATATYPE, MetaData.DataType.ROW.toString());
 		result.getMetadata().put(MetaData.DATANAME, "style");
-		result.getMetadata().put(MetaData.TABLE_NAME, "museum_hours");
+		result.getMetadata().put(MetaData.TABLE_NAME, "work");
 		return result;
 	}
 
@@ -283,7 +328,6 @@ public class TableService {
 		result.getMetadata().put(MetaData.DATANAME, tableMetadata.getTableName());
 		result.getMetadata().put(MetaData.TABLE_NAME, tableMetadata.getTableName());
 		result.getMetadata().put(MetaData.PRIMARY_KEY, false);
-		result.getMetadata().put(MetaData.TABLE_DDL, tableMetadata.getTableDdl());
 		return result;
 	}
 }
